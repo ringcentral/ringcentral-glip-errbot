@@ -1,0 +1,6 @@
+[Core]
+Name = Glip
+Module = glipbackend
+
+[Documentation]
+Description = Glip backend for ErrBot
