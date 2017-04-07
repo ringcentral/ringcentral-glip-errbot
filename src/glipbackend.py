@@ -5,8 +5,11 @@ import functools
 from errbot.backends.base import RoomError, Identifier, Person, RoomOccupant, ONLINE, Room, Message
 from errbot.core import ErrBot
 from errbot.utils import rate_limited
+from errbot import webhook
+from bottle import response
 from time import sleep
-from ringcentral.subscription import Events
+from ringcentral.http.api_exception import ApiException
+
 
 log = logging.getLogger('errbot.backends.glip')
 
@@ -202,6 +205,9 @@ class GlipBackend(ErrBot):
         self.appKey = identity.get('appKey', None)
         self.appSecret = identity.get('appSecret', None)
         self.server = identity.get('server', None)
+        self.webhook_server = identity.get('webhookServer', None)
+
+        self.webhook = None
 
         self.sdk = SDK(self.appKey, self.appSecret, self.server, 'glipbot', '0.0.0')
         self.bot_identifier = None  # Will be set in serve_once
@@ -247,29 +253,66 @@ class GlipBackend(ErrBot):
         except Exception as e:
             log.exception('Failed to load user %s', str(e))
 
-    def serve_once(self):
-        log.info("Initializing connection")
-        s = None
-
+    def _renew_webhook(self):
         try:
+            self.webhook = self.sdk.platform().put(self.webhook.url + '/renew')
+        except ApiException as e:
+            log.error('Webhook renew request failed in HTTP ' + str(e))
+        except Exception as e:
+            log.error('Webhook cannot be updated ' + str(e))
+        finally:
+            self.webhook = None
+            self.disconnect_callback()
+
+    @webhook('/errbot/glip', raw=True)
+    def receive_webhook(self, raw):
+        token = ''
+
+        if token != raw.get_header('Validation-Token'):
+            log.debug("Validation-Token not found. Webhook will NOT be processed")
+
+        else:
+            response.set_header('Validation-Token', token)
+            if '/subscription/' in raw.json['event']:
+                self._renew_webhook()
+            elif '/glip/posts' in raw.json['event']:
+                self._handle_message(raw.json)
+
+        return 'OK'
+
+    def serve_once(self):
+        try:
+            log.info('Initializing connection')
             self.authorize()
 
-            s = self.sdk.create_subscription()
-            s.add_events(['/account/~/extension/~/glip/posts'])
-            s.on(Events.notification, lambda msg: self._handle_message(msg))
-            s.register()
+            webhooks = self.sdk.platform().get('/subscription').json().records or []
 
+            self.webhook = next((wh for wh in webhooks if '/errbot/glip' in wh.deliveryMode.address), None)
+
+            if self.webhook:
+                self._renew_webhook()
+            else:
+                self.webhook = self.sdk.platform().post('/subscription', {
+                    'eventFilters': [
+                        self.sdk.platform().create_url('/account/~/extension/~/glip/posts'),
+                        self.sdk.platform().create_url('/subscription/~?threshold=60&interval=10')
+                    ],
+                    'deliveryMode': {
+                        'transportType': 'WebHook',
+                        'address': self.webhook_server + '/errbot/glip'  # FIXME Correct address
+                    }
+                }).json()
+
+            log.info("Connected")
             self.reset_reconnection_count()
             self.connect_callback()
-            log.info('Connected')
 
-            while self.sdk.platform().logged_in():  # If this condition is false, it means SDK failed to refresh
-                sleep(0.1)
+            # If this condition is false, it means SDK failed to refresh or webhook failed
+            while self.sdk.platform().logged_in() and self.webhook:
+                sleep(1)
 
         except KeyboardInterrupt:
             log.info("Interrupt received, shutting down")
-            if s:
-                s.destroy()
             return True
         except:
             log.exception("Error reading from Glip updates stream")
@@ -328,13 +371,13 @@ class GlipBackend(ErrBot):
         return GlipPerson({'id': txtrep})  # Can also be Room
 
     def build_reply(self, mess, text=None, private=False):
-        response = self.build_message(text)
-        # response.frm = self.bot_identifier
+        res = self.build_message(text)
+        # res.frm = self.bot_identifier
         if private:
-            response.to = mess.frm
+            res.to = mess.frm
         else:
-            response.to = mess.frm if mess.is_direct else mess.to
-        return response
+            res.to = mess.frm if mess.is_direct else mess.to
+        return res
 
     @property
     def mode(self):
